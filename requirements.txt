@@ -1,0 +1,14 @@
+protobuf
+transformers
+spacy
+tavily
+google-genai
+torch
+python-dotenv
+fastapi
+uvicorn
+pydantic
+langdetect
+googletrans
+deep-translator
+httpx
