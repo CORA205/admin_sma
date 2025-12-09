@@ -1,5 +1,6 @@
 import sqlite3
 import os
+import re
 import json
 import time
 import logging
@@ -13,7 +14,7 @@ from transformers import pipeline
 from tavily import TavilyClient
 from google.genai import Client
 from langdetect import detect
-from googletrans import Translator
+from deep_translator import GoogleTranslator
 from dotenv import load_dotenv
 
 # ==================== CONFIGURATION ====================
@@ -49,7 +50,14 @@ classifier = pipeline(
     use_fast=False
 )
 
-translator_global = Translator()
+#classifier = pipeline(
+#   "zero-shot-classification",
+#    model="MoritzLaurer/deberta-v3-base-mnli-fever-anli",
+#    use_fast=True,
+#    device=-1
+#)
+
+
 
 logger.info("Tous les modèles chargés avec succès ✅")
 
@@ -61,30 +69,39 @@ class Question(BaseModel):
     session_id: Optional[str] = None
 
 
-
 # =============== TRAITEMENT DES LANGUES =================
 
 async def first_lang(text):
     """Traduction asynchrone vers le français"""
-    original_lang = detect(text)
+    try:
+        original_lang = detect(text)
 
-    if original_lang != 'fr':
-        # Exécuter la traduction dans un thread séparé
-        translated_text = await asyncio.to_thread(
-            translator_global.translate, text, dest='fr'
-        )
-        return translated_text.text, original_lang
-    else:
-        return text, original_lang
+        if original_lang != 'fr':
+            def _translate():
+                return GoogleTranslator(source=original_lang, target='fr').translate(text)
+
+            translated_text = await asyncio.to_thread(_translate)
+            return translated_text, original_lang
+        else:
+            return text, original_lang
+
+    except Exception as e:
+        logger.error(f"Erreur first_lang: {e}")
+        return text, 'fr'
 
 
 async def last_lang(text, original_lang):
     """Traduction asynchrone vers la langue originale"""
     if original_lang != 'fr':
-        translated_text = await asyncio.to_thread(
-            translator_global.translate, text, dest=original_lang
-        )
-        return translated_text.text
+        try:
+            def _translate():
+                return GoogleTranslator(source='fr', target=original_lang).translate(text)
+
+            translated_text = await asyncio.to_thread(_translate)
+            return translated_text
+        except Exception as e:
+            logger.error(f"Erreur last_lang: {e}")
+            return text
     return text
 
 
@@ -153,6 +170,9 @@ class BinaryClassificationAgent:
                 return cached_data
 
         try:
+            logger.info(
+                "Debut de la classification"
+            )
 
             result = self.classifier(text, self.labels, multi_label=False)
 
@@ -305,7 +325,7 @@ class SyntheseAgent:
 
     def __init__(self, api_key: str):
         self.client = Client(api_key=api_key)
-        self.model = "gemini-2.5-flash"
+        self.model = "gemini-2.0-flash"
 
     async def execute(self, search_results: Dict, user_query: str) -> Dict:
         content = search_results.get("content", "")
@@ -328,7 +348,9 @@ class SyntheseAgent:
 
             # Parsing JSON
             try:
-                result = json.loads(text_output.strip())
+                cleaned_text = self._clean_gemini_response(text_output)
+                result = json.loads(cleaned_text)
+
             except json.JSONDecodeError:
                 logger.warning("Impossible de parser JSON Gemini, fallback appliqué")
                 return self._create_fallback_response(text_output, search_results)
@@ -357,6 +379,12 @@ class SyntheseAgent:
             return self._create_fallback_response(content, search_results)
 
     @staticmethod
+    def _clean_gemini_response(raw_text: str) -> str:
+        cleaned = re.sub(r"^```json\s*", "", raw_text.strip())
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+        return cleaned
+
+    @staticmethod
     def _build_prompt(query: str, content: str) -> str:
         return f"""Tu es un assistant spécialisé dans l'extraction d'informations administratives béninoises.
 
@@ -364,13 +392,14 @@ class SyntheseAgent:
     {query}
 
     **CONTENU DES SOURCES OFFICIELLES:**
-    {content[:4000]}
+    {content}
 
     **TA MISSION:**
     1. Lis attentivement le contenu ci-dessus
     2. Extrais TOUTES les informations structurées (pièces, coût, délai, lieux, étapes)
-    3. Réponds à la question en 2-4 phrases claires
+    3. Réponds à la question en phrases claires
     4. Retourne un JSON valide sans ```json ```
+    5. Detaille autant que tu peux les etapes et incomprehensions
 
     **EXEMPLE DE BONNE EXTRACTION:**
 
@@ -390,12 +419,12 @@ class SyntheseAgent:
     **TON TOUR MAINTENANT:**
 
     Analyse le contenu ci-dessus et retourne UN SEUL JSON avec ces clés EXACTES:
-    - "reponse" (string): Réponse synthétique en 2-4 phrases
+    - "reponse" (string): Réponse synthétique
     - "pieces_requises" (array ou null): Liste de TOUS les documents mentionnés
     - "cout" (string ou null): Montant EXACT en FCFA
     - "delai_traitement" (string ou null): Durée EXACTE
-    - "lieux" (array ou null): Liste des adresses/services
-    - "etapes" (array ou null): Liste des étapes numérotées
+    - "lieux" (array ou null): Liste des adresses/services, liens en ligne(avec precision), ou suggestions
+    - "etapes" (array ou null): Liste des étapes numérotées et detaillees
     - "sources" (array): URLs des sources
 
     **RÈGLES ABSOLUES:**
@@ -432,14 +461,109 @@ class SyntheseAgent:
 
     @staticmethod
     def _create_fallback_response(content: str, search_results: Dict) -> Dict:
-        """Fallback si Gemini échoue ou JSON invalide"""
+        """
+        Fallback avancé sans IA :
+        Extraction robuste par regex + nettoyage sémantique des infos clés
+        """
+        import re
+
+        logger.info("🔧 Fallback : extraction par mapping regex")
+
+        # Sécuriser le texte
+        content = content.strip()
+        if not content:
+            return {
+                "reponse": "Aucune information exploitable n’a été trouvée.",
+                "pieces_requises": None,
+                "cout": None,
+                "delai_traitement": None,
+                "lieux": None,
+                "etapes": None,
+                "sources": search_results.get("sources", [])
+            }
+
+        # === 1️⃣ EXTRACTION DU COÛT ===
+        cout = None
+        cout_patterns = [
+            r'(\d{2,6}(?:[\s\.,]?\d{3})*)\s*(?:FCFA|F\s*CFA)',
+            r'co[uû]t[:\s]+(\d+(?:[\s\.,]?\d{3})*)',
+            r'prix[:\s]+(\d+(?:[\s\.,]?\d{3})*)',
+            r'montant[:\s]+(\d+(?:[\s\.,]?\d{3})*)'
+        ]
+        for pattern in cout_patterns:
+            match = re.search(pattern, content, re.IGNORECASE)
+            if match:
+                cout = f"{match.group(1).replace(' ', '').replace(',', '').replace('.', '')} FCFA"
+                break
+
+        # === 2️⃣ EXTRACTION DU DÉLAI ===
+        delai = None
+        delai_patterns = [
+            r'd[ée]lai[:\s]+(\d+)\s*(jours?|semaines?|mois)',
+            r'traitement[:\s]+(\d+)\s*(jours?|semaines?|mois)',
+            r'(\d+)\s*(jours?|semaines?|mois)\s*(?:ouvrables|de traitement)?'
+        ]
+        for pattern in delai_patterns:
+            match = re.search(pattern, content, re.IGNORECASE)
+            if match:
+                delai = f"{match.group(1)} {match.group(2)}"
+                break
+
+        # === 3️⃣ EXTRACTION DES PIÈCES REQUISES ===
+        pieces = None
+        pieces_section = re.search(
+            r'pi[eè]ces?\s+(?:à\s+fournir|requises?|n[eé]cessaires?)[:\s]*(.*?)(?:\n\n|\Z)',
+            content,
+            re.IGNORECASE | re.DOTALL
+        )
+        if pieces_section:
+            pieces_text = pieces_section.group(1)
+            pieces_list = re.split(r'[•\-*\n]+', pieces_text)
+            pieces = [p.strip(" -•*:\t") for p in pieces_list if len(p.strip()) > 3]
+            pieces = pieces[:10] if pieces else None
+
+        # === 4️⃣ EXTRACTION DES LIEUX ===
+        lieux = None
+        lieux_patterns = [
+            r'(?:adresse|lieu|où\s+(?:se\s+faire\s+|effectuer))[:\s]+([^\n]+)',
+            r'(?:mairie|préfecture|commune|service\s+public)[:\s]+([^\n]+)'
+        ]
+        for pattern in lieux_patterns:
+            match = re.search(pattern, content, re.IGNORECASE)
+            if match:
+                lieux = [match.group(1).strip()]
+                break
+
+        # === 5️⃣ GÉNÉRATION DU RÉSUMÉ ===
+        paragraphs = [p.strip() for p in re.split(r'\n{2,}', content) if len(p.strip()) > 100]
+        summary = paragraphs[0] if paragraphs else content[:400].rsplit(" ", 1)[0]
+
+        reponse_parts = [summary]
+        if cout:
+            reponse_parts.append(f"💰 Le coût est de {cout}.")
+        if delai:
+            reponse_parts.append(f"⏱️ Le délai de traitement est d’environ {delai}.")
+        if pieces:
+            reponse_parts.append(f"📋 Pièces requises : {', '.join(pieces[:3])}.")
+
+        reponse = " ".join(reponse_parts)
+        if len(reponse) > 500:
+            reponse = reponse[:497] + "..."
+
+        logger.info(
+            f"✅ Fallback mapping : coût={'✓' if cout else '✗'}, "
+            f"délai={'✓' if delai else '✗'}, "
+            f"pièces={'✓' if pieces else '✗'}, "
+            f"lieux={'✓' if lieux else '✗'}"
+        )
+
         return {
-            "reponse": content[:500] + "..." if len(content) > 500 else content,
-            "pieces_requises": search_results.get("pieces_requises"),
-            "cout": search_results.get("cout"),
-            "delai_traitement": search_results.get("delai_traitement"),
-            "lieux": search_results.get("lieux"),
-            "etapes": search_results.get("etapes"),
+            "reponse": reponse + " (Consultez les sources ci-dessous pour plus de détails.)",
+            "pieces_requises": pieces,
+            "cout": cout,
+            "delai_traitement": delai,
+            "lieux": lieux,
+            "etapes": None,  # Extraction complexe sans NLP
             "sources": search_results.get("sources", [])
         }
 
@@ -567,10 +691,10 @@ async def get_info(q: Question):
 
             # Traduire vers langue originale SI nécessaire
             if langue_origine != 'fr':
-                translated_obj = await asyncio.to_thread(
-                    translator_global.translate, reponse_hors_sujet_fr, langue_origine
-                )
-                reponse_finale = translated_obj.text
+                def _translate():
+                    return GoogleTranslator(source='fr', target=langue_origine).translate(reponse_hors_sujet_fr)
+
+                reponse_finale = await asyncio.to_thread(_translate)
 
                 logger.info(f"🌐 Réponse hors-sujet traduite vers {langue_origine}")
             else:
@@ -690,16 +814,13 @@ async def get_info(q: Question):
         # Réponse d'erreur avec traduction si possible
         erreur_message = f"Erreur technique: {str(e)}"
         try:
-            # Essayer de détecter la langue depuis la question originale
             detected_lang = detect(q.text)
             if detected_lang != 'fr':
-                translated_obj = await asyncio.to_thread(
-                    translator_global.translate, erreur_message, detected_lang
-                )
-                erreur_message = translated_obj.text
+                def _translate():
+                    return GoogleTranslator(source='fr', target=detected_lang).translate(erreur_message)
 
+                erreur_message = await asyncio.to_thread(_translate)
         except Exception as trans_error:
-
             logger.error(f"Erreur détection langue pour erreur: {trans_error}")
 
         raise HTTPException(
