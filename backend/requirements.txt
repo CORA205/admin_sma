@@ -1,5 +1,5 @@
---extra-index-url download.pytorch.org
-torch==2.5.1+cpu
+
+torch>=2.5.0
 transformers
 spacy==3.7.5
 github.com
