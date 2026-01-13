@@ -1,9 +1,7 @@
-
-torch>=2.5.0
+torch --index-url download.pytorch.org
 transformers
 spacy==3.7.5
 github.com
-protobuf
 pandas
 tavily
 google-genai
@@ -17,3 +15,4 @@ googletrans==4.0.0-rc1
 deep-translator
 httpx
 requests
+
