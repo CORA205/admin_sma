@@ -1,11 +1,12 @@
 import streamlit as st
+import os
 import requests
 import json
 import time
 from datetime import datetime
 
 # Configuration
-API_URL = "http://localhost:8000"
+API_URL = os.getenv("API_URL", "http://localhost:8000")
 
 # Page config
 st.set_page_config(
