@@ -1,4 +1,5 @@
 protobuf
+pandas
 transformers
 spacy
 tavily
@@ -8,7 +9,11 @@ python-dotenv
 fastapi
 uvicorn
 pydantic
+groq
 langdetect
 googletrans
 deep-translator
 httpx
+streamlit
+requests
+pyngrok

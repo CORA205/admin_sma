@@ -12,7 +12,8 @@ from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 from transformers import pipeline
 from tavily import TavilyClient
-from google.genai import Client
+# from google.genai import Client
+from groq import Groq
 from langdetect import detect
 from deep_translator import GoogleTranslator
 from dotenv import load_dotenv
@@ -22,7 +23,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
-GENAI_KEY = os.getenv("GEMINI_API_KEY", "")
+# GENAI_KEY = os.getenv("GEMINI_API_KEY", "")
+GROQ_KEY = os.getenv("GROQ_KEY", "")
 
 # Chargement configuration
 with open("config.json", "r", encoding="utf-8") as f:
@@ -42,13 +44,28 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Chargement modèles
-logger.info("Chargement du classificateur XLM-RoBERTa...")
+logger.info("Chargement du classificateur MoritzLaurer/multilingual-MiniLMv2-L6-mnli-xnli")
 classifier = pipeline(
     "zero-shot-classification",
-    model="joeddav/xlm-roberta-large-xnli",
-    tokenizer="xlm-roberta-large",
-    use_fast=False
+    model="MoritzLaurer/multilingual-MiniLMv2-L6-mnli-xnli", # 5x plus petit que votre XLM-R
+    use_fast=True # Indispensable pour la vitesse CPU
 )
+
+
+# classifier = pipeline(
+#     "zero-shot-classification",
+#     model="MoritzLaurer/mDeBERTa-v3-base-mnli-xnli", # Plus petit et précis mais pres de deux minutes de latence
+#     use_fast=True
+# )
+
+
+
+# classifier = pipeline(
+#     "zero-shot-classification",
+#     model="joeddav/xlm-roberta-large-xnli",
+#     tokenizer="xlm-roberta-large",
+#     use_fast=False
+# ) en moyenne 26secondes
 
 #classifier = pipeline(
 #   "zero-shot-classification",
@@ -181,7 +198,7 @@ class BinaryClassificationAgent:
 
             # Boost pour mots-clés administratifs évidents
             admin_keywords = [
-                'passeport', 'cni', 'carte', 'identité', 'naissance', 'acte',
+                'passeport', 'cni', 'carte','cip', 'identité', 'naissance', 'acte',
                 'mariage', 'permis', 'conduire', 'impôts', 'taxe', 'douane',
                 'entreprise', 'rccm', 'visa', 'certificat', 'attestation',
                 'déclaration', 'dédouanement', 'immatriculation', 'greffier'
@@ -253,7 +270,7 @@ class SmartSearchAgent:
             def _do_search():
                 return self.client.search(
                     query=search_query,
-                    max_results=5,
+                    max_results=10,
                     include_domains=OFFICIAL_SOURCES,
                     search_depth="advanced",
                     include_images=False
@@ -324,8 +341,8 @@ class SyntheseAgent:
     """
 
     def __init__(self, api_key: str):
-        self.client = Client(api_key=api_key)
-        self.model = "gemini-2.0-flash"
+        self.client = Groq(api_key=api_key)
+        self.model = "llama-3.3-70b-versatile"
 
     async def execute(self, search_results: Dict, user_query: str) -> Dict:
         content = search_results.get("content", "")
@@ -336,15 +353,17 @@ class SyntheseAgent:
         prompt = self._build_prompt(user_query, content)
 
         try:
-            logger.info("Appel Gemini ...")
-            response = await self.client.aio.models.generate_content(
-                model=self.model,
-                contents=prompt
+            logger.info("Appel LLM Groq ...")
+            response = self.client.chat.completions.create(
+                model= self.model,
+                messages= [{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=1024
             )
 
             # Récupération du texte généré
-            text_output = response.text
-            logger.info(f"Réponse brute Gemini: {text_output}")
+            text_output = response.choices[0].message.content
+            logger.info(f"Réponse structurée llm : {text_output}")
 
             # Parsing JSON
             try:
@@ -392,49 +411,92 @@ class SyntheseAgent:
     {query}
 
     **CONTENU DES SOURCES OFFICIELLES:**
-    {content}
+    {content[:7000]}  # ⚠️ Augmenté de 5000 à 7000 pour plus de contexte
 
     **TA MISSION:**
-    1. Lis attentivement le contenu ci-dessus
-    2. Extrais TOUTES les informations structurées (pièces, coût, délai, lieux, étapes)
-    3. Réponds à la question en phrases claires
-    4. Retourne un JSON valide sans ```json ```
-    5. Detaille autant que tu peux les etapes et incomprehensions
+    1. Lis ATTENTIVEMENT le contenu ci-dessus
+    2. Extrais TOUTES les informations structurées disponibles
+    3. Si le contenu ne répond PAS à la question, dis-le clairement
+    4. Réponds en détaillant le plus possible et en expliquant les expressions, la procedure et tout 
+    5. Retourne UN JSON valide
 
-    **EXEMPLE DE BONNE EXTRACTION:**
+    **RÈGLES CRITIQUES:**
+    - Si tu ne trouves PAS d'information pertinente, mets "reponse": "Les sources consultées ne contiennent pas d'information sur [sujet]."
+    - N'invente JAMAIS d'informations
+    - Utilise null pour les champs vides (pas "", pas [])
+    - Extrais les références légales si présentes
+    - Extrais les liens utiles si présents
 
-    Contenu brut: "Pièces requises: CNI, Acte de naissance. Coût: 25000 FCFA. Délai: 15 jours."
-
-    Réponse JSON attendue:
+    **FORMAT JSON EXACT:**
     {{
-      "reponse": "Pour obtenir le document, vous devez fournir votre CNI et votre acte de naissance. Le coût est de 25 000 FCFA et le traitement prend 15 jours.",
-      "pieces_requises": ["CNI", "Acte de naissance"],
-      "cout": "25 000 FCFA",
-      "delai_traitement": "15 jours",
-      "lieux": null,
-      "etapes": null,
-      "sources": ["https://service-public.bj"]
+      "reponse": "Réponse synthétique claire (2-4 phrases)",
+      "pieces_requises": ["Document 1", "Document 2"] ou null,
+      "cout": "Montant FCFA exact" ou null,
+      "delai_traitement": "Durée précise" ou null,
+      "lieux": {{
+        "nom": "Nom de l'organisme",
+        "adresse": "Adresse complète ou ville",
+        "horaires": "Horaires d'ouverture",
+        "telephone": "Numéro de téléphone",
+        "email": "Email si disponible"
+      }} ou null,
+      "etapes": ["Étape 1", "Étape 2", "..."] ou null,
+      "references_legales": ["Décret X", "Loi Y"] ou null,
+      "liens_utiles": [
+        {{"titre": "Nom du lien", "url": "https://..."}},
+        {{"titre": "...", "url": "..."}}
+      ] ou null,
+      "cas_particuliers": {{
+        "mineurs": "Informations spécifiques mineurs" ou null,
+        "diaspora": "Informations spécifiques diaspora" ou null,
+        "autres": "Autres cas particuliers" ou null
+      }} ou null
     }}
 
-    **TON TOUR MAINTENANT:**
+    **EXEMPLE - Renouvellement passeport:**
+    {{
+      "reponse": "Pour renouveler votre passeport béninois, vous devez prendre rendez-vous obligatoire sur ePasseport.service-public.bj puis vous présenter à la DEI à Cotonou avec votre dossier complet. Le coût est de 30 000 FCFA et le délai est de 5 jours ouvrables.",
+      "pieces_requises": [
+        "Ancien passeport biométrique (original + copie page identitaire)",
+        "Acte de naissance sécurisé ANIP",
+        "Certificat d'identification personnelle (CIP) ANIP",
+        "1 photo d'identité couleur 35x45mm fond blanc",
+        "Preuve de profession (si changement)"
+      ],
+      "cout": "30 000 FCFA au Bénin (variable diaspora: 100 EUR ou 130 USD)",
+      "delai_traitement": "5 jours ouvrables à compter de l'enrôlement",
+      "lieux": {{
+        "nom": "Direction de l'Émigration et de l'Immigration (DEI)",
+        "adresse": "Cotonou, Bénin",
+        "horaires": "Lundi-Vendredi: 08h00-12h30 et 15h00-18h30",
+        "telephone": "+229 21316938 / +229 21314915",
+        "email": null
+      }},
+      "etapes": [
+        "1. Vérifier documents ANIP (acte naissance + CIP)",
+        "2. Prendre rendez-vous obligatoire sur ePasseport.service-public.bj",
+        "3. Préparer dossier complet",
+        "4. Se présenter DEI pour enrôlement biométrique",
+        "5. Payer 30 000 FCFA",
+        "6. Retirer passeport après 5 jours ouvrables"
+      ],
+      "references_legales": [
+        "Décret 14-053 du 6 mars 2014",
+        "Loi N°86-012 du 26 février 1986"
+      ],
+      "liens_utiles": [
+        {{"titre": "Prise de rendez-vous ePasseport", "url": "https://epasseport.service-public.bj"}},
+        {{"titre": "Vérification statut demande", "url": "https://verification.epasseport.service-public.bj"}},
+        {{"titre": "ANIP - Documents d'identification", "url": "https://eservices.anip.bj"}}
+      ],
+      "cas_particuliers": {{
+        "mineurs": "Autorisation parentale signée d'un géniteur obligatoire avec pièce d'identité",
+        "diaspora": "Demande via ambassades/consulats (délai 4-8 semaines) ou plateforme ePass 100% en ligne",
+        "autres": "Béninois naturalisés : certificat de nationalité requis"
+      }}
+    }}
 
-    Analyse le contenu ci-dessus et retourne UN SEUL JSON avec ces clés EXACTES:
-    - "reponse" (string): Réponse synthétique
-    - "pieces_requises" (array ou null): Liste de TOUS les documents mentionnés
-    - "cout" (string ou null): Montant EXACT en FCFA
-    - "delai_traitement" (string ou null): Durée EXACTE
-    - "lieux" (array ou null): Liste des adresses/services, liens en ligne(avec precision), ou suggestions
-    - "etapes" (array ou null): Liste des étapes numérotées et detaillees
-    - "sources" (array): URLs des sources
-
-    **RÈGLES ABSOLUES:**
-    ✓ EXTRAIS tout, n'invente rien
-    ✓ Utilise null (pas "", pas []) pour infos absentes
-    ✓ PAS de copier-coller du texte brut dans "reponse"
-    ✓ Commence directement par {{ (pas de texte avant)
-    ✓ Termine par }} (pas de texte après)
-
-    JSON:"""
+    Retourne UNIQUEMENT le JSON (commence par {{ et termine par }}):"""
     @staticmethod
     def _clean_result(result: Dict) -> Dict:
         """Nettoie le résultat Gemini"""
@@ -563,7 +625,7 @@ class SyntheseAgent:
             "cout": cout,
             "delai_traitement": delai,
             "lieux": lieux,
-            "etapes": None,  # Extraction complexe sans NLP
+            "etapes": None,
             "sources": search_results.get("sources", [])
         }
 
@@ -733,7 +795,7 @@ async def get_info(q: Question):
 
         # ===== ÉTAPE 4: SYNTHÈSE AVEC GEMINI =====
         logger.info("🧠 Synthèse avec Gemini...")
-        synth_agent = SyntheseAgent(api_key=GENAI_KEY)
+        synth_agent = SyntheseAgent(api_key=GROQ_KEY)
         synthesis = await synth_agent.execute(search_results, question_fr)
 
         # ===== ÉTAPE 5: CONSTRUCTION RÉPONSE =====
