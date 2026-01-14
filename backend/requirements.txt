@@ -1,17 +1,13 @@
-torch --index-url download.pytorch.org
 transformers
-spacy==3.7.5
-github.com
+spacy
 pandas
 tavily
-google-genai
 python-dotenv
 fastapi
 uvicorn
 pydantic
 groq
 langdetect
-googletrans==4.0.0-rc1
 deep-translator
 httpx
 requests
