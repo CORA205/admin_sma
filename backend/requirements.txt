@@ -1,4 +1,5 @@
 transformers
+torch
 spacy
 pandas
 tavily
