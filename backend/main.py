@@ -473,12 +473,12 @@ class SyntheseAgent:
         "email": null
       }},
       "etapes": [
-        "1. Vérifier documents ANIP (acte naissance + CIP)",
-        "2. Prendre rendez-vous obligatoire sur ePasseport.service-public.bj",
-        "3. Préparer dossier complet",
-        "4. Se présenter DEI pour enrôlement biométrique",
-        "5. Payer 30 000 FCFA",
-        "6. Retirer passeport après 5 jours ouvrables"
+        " Vérifier documents ANIP (acte naissance + CIP)",
+        " Prendre rendez-vous obligatoire sur ePasseport.service-public.bj",
+        " Préparer dossier complet",
+        " Se présenter DEI pour enrôlement biométrique",
+        " Payer 30 000 FCFA",
+        " Retirer passeport après 5 jours ouvrables"
       ],
       "references_legales": [
         "Décret 14-053 du 6 mars 2014",
