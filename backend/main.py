@@ -405,19 +405,19 @@ class SyntheseAgent:
 
     @staticmethod
     def _build_prompt(query: str, content: str) -> str:
-        return f"""Tu es un assistant spécialisé dans l'extraction d'informations administratives béninoises.
+        return f"""Tu es un assistant spécialisé dans l'orientation avec explications et l'extraction d'informations administratives béninoises.
 
     **QUESTION DE L'UTILISATEUR:**
     {query}
 
     **CONTENU DES SOURCES OFFICIELLES:**
-    {content[:7000]}  # ⚠️ Augmenté de 5000 à 7000 pour plus de contexte
+    {content[:8000]}  
 
     **TA MISSION:**
     1. Lis ATTENTIVEMENT le contenu ci-dessus
     2. Extrais TOUTES les informations structurées disponibles
     3. Si le contenu ne répond PAS à la question, dis-le clairement
-    4. Réponds en détaillant le plus possible et en expliquant les expressions, la procedure et tout 
+    4. Réponds en détaillant le plus possible et en expliquant les expressions, la procedure et tout de la manière la plus claire et compréhensible possible 
     5. Retourne UN JSON valide
 
     **RÈGLES CRITIQUES:**
