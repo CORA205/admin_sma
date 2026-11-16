@@ -1,8 +1,6 @@
 transformers
 torch
-spacy
-pandas
-tavily
+tavily-python
 python-dotenv
 fastapi
 uvicorn

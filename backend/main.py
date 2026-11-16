@@ -47,8 +47,8 @@ logger = logging.getLogger(__name__)
 logger.info("Chargement du classificateur MoritzLaurer/multilingual-MiniLMv2-L6-mnli-xnli")
 classifier = pipeline(
     "zero-shot-classification",
-    model="MoritzLaurer/multilingual-MiniLMv2-L6-mnli-xnli", # 5x plus petit que votre XLM-R
-    use_fast=True # Indispensable pour la vitesse CPU
+    model="MoritzLaurer/multilingual-MiniLMv2-L6-mnli-xnli",
+    use_fast=True
 )
 
 
@@ -160,9 +160,29 @@ class BinaryClassificationAgent:
     def __init__(self):
         self.classifier = classifier
         self.labels = [
-            "question sur démarches administratives ou services publics béninois",
-            "question hors sujet administration, conversation générale ou autre"
+             "administrative procedures, official documents, government services in Benin",
+             "casual conversation, general knowledge, unrelated topics"
         ]
+        # Marge minimale (score_admin - score_hors_sujet) pour valider ADMIN sans arbitrage.
+        # Zone grise : |marge| < ADMIN_MARGIN → arbitrage LLM (ArbiterAgent).
+        self.ADMIN_MARGIN = 0.10
+        self.ADMIN_KEYWORDS = [
+            # Démarches classiques
+            'passeport', 'cni', 'carte', 'cip', 'identité', 'naissance', 'acte',
+            'mariage', 'permis', 'impôts', 'taxe', 'douane', 'entreprise',
+            'rccm', 'visa', 'certificat', 'attestation', 'déclaration',
+            'dédouanement', 'immatriculation', 'greffier', 'conduire',
+            # Justice / Trésor / forces de l'ordre (ex: amende au Trésor)
+            'amende', 'trésor', 'tresor', 'police', 'gendarmerie', 'commissariat',
+            'tribunal', 'audience', 'avocat', 'contravention', 'délit', 'delit',
+            'plainte', 'procureur', 'huissier', 'notaire', 'récépissé',
+            'justice', 'prison', 'casier', 'préfecture', 'anip', 'guichet',
+        ]
+        # Matching par frontière de mot (\b) : "acte" ne matche pas "tactique",
+        # "carte" ne matche pas "cartes bancaires" indûment, etc.
+        self._kw_pattern = re.compile(
+            r"\b(?:" + "|".join(re.escape(k) for k in self.ADMIN_KEYWORDS) + r")\b"
+        )
         self._cache = {}
         self._cache_ttl = 1800  # 30min
 
@@ -192,26 +212,32 @@ class BinaryClassificationAgent:
             )
 
             result = self.classifier(text, self.labels, multi_label=False)
+            score_map = dict(zip(result['labels'], result['scores']))
+            admin_score = score_map.get(self.labels[0], 0.0)
+            other_score = score_map.get(self.labels[1], 0.0)
+            margin = admin_score - other_score
 
-            is_admin = result['labels'][0] == self.labels[0]
-            confidence = result['scores'][0]
+            # Décision par MARGE (écart entre les 2 labels) au lieu d'un seuil absolu :
+            # une question à 0.55 admin / 0.20 hors-sujet est clairement ADMIN
+            # bien que sa confiance absolue soit "basse".
+            is_admin = margin >= self.ADMIN_MARGIN
+            needs_arbiter = abs(margin) < self.ADMIN_MARGIN
 
-            # Boost pour mots-clés administratifs évidents
-            admin_keywords = [
-                'passeport', 'cni', 'carte','cip', 'identité', 'naissance', 'acte',
-                'mariage', 'permis', 'conduire', 'impôts', 'taxe', 'douane',
-                'entreprise', 'rccm', 'visa', 'certificat', 'attestation',
-                'déclaration', 'dédouanement', 'immatriculation', 'greffier'
-            ]
-
-            if any(kw in text.lower() for kw in admin_keywords):
-                confidence = min(1.0, confidence + 0.15)
+            # Boost mots-clés administratifs (frontières de mots) : force ADMIN
+            if self._kw_pattern.search(text.lower()):
+                admin_score = min(1.0, admin_score + 0.15)
+                margin = admin_score - other_score
                 is_admin = True
+                needs_arbiter = False
 
             result_data = {
                 "is_admin_topic": is_admin,
-                "confidence": confidence,
-                "label": result['labels'][0]
+                "confidence": max(admin_score, other_score),
+                "label": result['labels'][0],
+                "admin_score": round(admin_score, 3),
+                "other_score": round(other_score, 3),
+                "margin": round(margin, 3),
+                "needs_arbiter": needs_arbiter,
             }
 
             # Cache store
@@ -219,7 +245,8 @@ class BinaryClassificationAgent:
 
             logger.info(
                 f"Classification: {'ADMIN' if is_admin else 'HORS-SUJET'} "
-                f"(conf: {confidence:.2f})"
+                f"(score_admin: {admin_score:.2f}, score_autre: {other_score:.2f}, "
+                f"marge: {margin:.2f}{', zone grise → arbitrage' if needs_arbiter else ''})"
             )
 
             return result_data
@@ -232,6 +259,53 @@ class BinaryClassificationAgent:
                 "confidence": 0.5,
                 "label": "erreur_classification"
             }
+
+
+class ArbiterAgent:
+    """
+    Deuxième avis : arbitrage LLM léger (gpt-oss-20b) des questions ambiguës,
+    appelé uniquement quand le classificateur n'a pas de marge claire
+    (|marge| < ADMIN_MARGIN). ~0,5-1 s de latence, coût quasi nul.
+    """
+
+    def __init__(self):
+        self.client = Groq(api_key=GROQ_KEY)
+        self.model = "openai/gpt-oss-20b"
+        self._prompt_template = (
+            "Détermine si la question suivante concerne une démarche administrative, "
+            "un document officiel ou un service public au Bénin (papiers, permis, impôts, "
+            "justice, police, amende, mairie, entreprise, santé, école, etc.).\n\n"
+            "QUESTION : {question}\n\n"
+            "Réponds UNIQUEMENT par le mot OUI ou par le mot NON."
+        )
+
+    async def execute(self, text: str) -> bool:
+        """
+        Retourne True si la question est jugée administrative.
+        En cas d'échec (réseau, timeout), on laisse passer (conservateur).
+        """
+        def _call():
+            return self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user",
+                           "content": self._prompt_template.format(question=text)}],
+                temperature=0.0,
+                max_tokens=200,
+                reasoning_effort="low",
+            )
+
+        try:
+            loop = asyncio.get_event_loop()
+            response = await asyncio.wait_for(
+                loop.run_in_executor(None, _call), timeout=15
+            )
+            out = (response.choices[0].message.content or "").strip().upper()
+            is_admin = "OUI" in out and "NON" not in out
+            logger.info(f"⚖️ Arbitrage LLM: {'ADMIN' if is_admin else 'HORS-SUJET'} ({out[:20]})")
+            return is_admin
+        except Exception as e:
+            logger.error(f"Erreur arbitrage LLM: {e} → décision conservatrice (ADMIN)")
+            return True
 
 
 class SmartSearchAgent:
@@ -273,7 +347,10 @@ class SmartSearchAgent:
                     max_results=10,
                     include_domains=OFFICIAL_SOURCES,
                     search_depth="advanced",
-                    include_images=False
+                    include_images=False,
+                    # Texte complet des pages au lieu de snippets (insensible
+                    # à la variabilité des extraits du moteur)
+                    include_raw_content="markdown"
                 )
 
             loop = asyncio.get_event_loop()
@@ -305,14 +382,16 @@ class SmartSearchAgent:
     @staticmethod
     def _process_results(response: Dict) -> Dict:
 
-        """Agrège les résultats Tavily"""
+        """Agrège les résultats Tavily : texte complet (raw_content) si dispo,
+        sinon extrait court (content). Chaque source plafonnée pour éviter
+        qu'une seule page domine le contexte du LLM."""
         results = response.get("results", [])
 
         # Agrège TOUS les contenus (pas juste le premier)
         all_content = "\n\n--- NOUVELLE SOURCE ---\n\n".join([
-            f"📄 Source: {r['url']}\n\n{r['content']}"
+            f"📄 Source: {r['url']}\n\n{(r.get('raw_content') or r.get('content') or '')[:8000]}"
             for r in results[:5]
-            if r.get('content')
+            if r.get('raw_content') or r.get('content')
         ])
 
         sources = [r["url"] for r in results if r.get("url")]
@@ -342,7 +421,7 @@ class SyntheseAgent:
 
     def __init__(self, api_key: str):
         self.client = Groq(api_key=api_key)
-        self.model = "llama-3.3-70b-versatile"
+        self.model = "openai/gpt-oss-120b"  # llama-3.3-70b-versatile a été retiré du catalogue Groq
 
     async def execute(self, search_results: Dict, user_query: str) -> Dict:
         content = search_results.get("content", "")
@@ -358,7 +437,8 @@ class SyntheseAgent:
                 model= self.model,
                 messages= [{"role": "user", "content": prompt}],
                 temperature=0.1,
-                max_tokens=1024
+                max_tokens=6000,          # gpt-oss = modèle à raisonnement : budget élargi (1024 tronquait le JSON)
+                reasoning_effort="low"    # limite les tokens de réflexion pour laisser la place à la réponse
             )
 
             # Récupération du texte généré
@@ -371,7 +451,7 @@ class SyntheseAgent:
                 result = json.loads(cleaned_text)
 
             except json.JSONDecodeError:
-                logger.warning("Impossible de parser JSON Gemini, fallback appliqué")
+                logger.warning("Impossible de parser JSON LLM, fallback appliqué")
                 return self._create_fallback_response(text_output, search_results)
 
             result = self._clean_result(result)
@@ -387,6 +467,9 @@ class SyntheseAgent:
                 "delai_traitement": result.get("delai_traitement"),
                 "lieux": result.get("lieux"),
                 "etapes": result.get("etapes"),
+                "references_legales": result.get("references_legales"),
+                "liens_utiles": result.get("liens_utiles"),
+                "cas_particuliers": result.get("cas_particuliers"),
                 "sources": result.get("sources", search_results.get("sources", []))
             }
 
@@ -399,8 +482,13 @@ class SyntheseAgent:
 
     @staticmethod
     def _clean_gemini_response(raw_text: str) -> str:
-        cleaned = re.sub(r"^```json\s*", "", raw_text.strip())
+        cleaned = re.sub(r"^```(?:json)?\s*", "", raw_text.strip(), flags=re.IGNORECASE)
         cleaned = re.sub(r"\s*```$", "", cleaned)
+        # Extrait l'objet JSON principal : du premier { au dernier }
+        # (ignore tout texte parasite autour : raisonnement, préambules, etc.)
+        start, end = cleaned.find("{"), cleaned.rfind("}")
+        if start != -1 and end > start:
+            cleaned = cleaned[start:end + 1]
         return cleaned
 
     @staticmethod
@@ -411,7 +499,7 @@ class SyntheseAgent:
     {query}
 
     **CONTENU DES SOURCES OFFICIELLES:**
-    {content[:8000]}  
+    {content[:24000]}  
 
     **TA MISSION:**
     1. Lis ATTENTIVEMENT le contenu ci-dessus
@@ -422,7 +510,10 @@ class SyntheseAgent:
 
     **RÈGLES CRITIQUES:**
     - Si tu ne trouves PAS d'information pertinente, mets "reponse": "Les sources consultées ne contiennent pas d'information sur [sujet]."
+    - Si la situation décrite implique une arrestation, une infraction, des poursuites ou un litige, ajoute à la fin de "reponse" une courte phrase recommandant de consulter un avocat si nécessaire
     - N'invente JAMAIS d'informations
+    - LIENS : cite UNIQUEMENT des URLs clairement visibles dans le contenu des sources ci-dessus ; sinon ne propose aucun lien (NE JAMAIS deviner une URL)
+    - Utilise null pour les champs vides (pas "", pas [])
     - Utilise null pour les champs vides (pas "", pas [])
     - Extrais les références légales si présentes
     - Extrais les liens utiles si présents
@@ -735,12 +826,22 @@ async def get_info(q: Question):
             question_fr = q.text
             langue_origine = 'fr'
 
-        # ===== ÉTAPE 1: CLASSIFICATION BINAIRE =====
+        # ===== ÉTAPE 1: CLASSIFICATION BINAIRE (marge + mots-clés) =====
         classifier_agent = BinaryClassificationAgent()
         classif = await classifier_agent.execute(question_fr)
 
+        # ===== ÉTAPE 1bis: ARBITRAGE LLM EN ZONE GRISE =====
+        if classif.get("needs_arbiter"):
+            logger.info(
+                f"⚖️ Marge ambiguë ({classif.get('margin')}) → arbitrage gpt-oss-20b"
+            )
+            verdict = await ArbiterAgent().execute(question_fr)
+            classif["is_admin_topic"] = verdict
+            classif["needs_arbiter"] = False
+            classif["arbitrated"] = True
+
         # ===== ÉTAPE 2: FILTRE HORS-SUJET =====
-        if not classif["is_admin_topic"] or classif["confidence"] < 0.65:
+        if not classif["is_admin_topic"]:
             logger.info(f"🚫 Question hors-sujet détectée (conf: {classif['confidence']:.2f})")
 
             # Préparer la réponse hors-sujet (en français d'abord)
@@ -771,6 +872,9 @@ async def get_info(q: Question):
                 "delai_traitement": None,
                 "lieux": None,
                 "etapes": None,
+                "references_legales": None,
+                "liens_utiles": None,
+                "cas_particuliers": None,
                 "sources": [],
                 "metadata": {
                     "label": classif["label"],
@@ -810,6 +914,9 @@ async def get_info(q: Question):
             "delai_traitement": synthesis.get("delai_traitement"),
             "lieux": synthesis.get("lieux"),
             "etapes": synthesis.get("etapes"),
+            "references_legales": synthesis.get("references_legales"),
+            "liens_utiles": synthesis.get("liens_utiles"),
+            "cas_particuliers": synthesis.get("cas_particuliers"),
             "sources": synthesis.get("sources", []),
             "metadata": {
                 "label": classif["label"],
@@ -900,7 +1007,7 @@ async def health_check():
         "components": {
             "classifier": "XLM-RoBERTa",
             "search": "Tavily",
-            "synthesis": "Gemini 2.5 Flash",
+            "synthesis": "Groq gpt-oss-120b",
             "database": "SQLite"
         }
     }
